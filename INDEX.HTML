@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="es">
+	<head>
+		<meta charset="utf-8" />
+		<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="description" content="Página de reconocimiento de objetos - plantilla básica" />
+		<title>Reconocimiento de Objetos</title>
+		<!-- Enlaza un archivo CSS si lo necesitas: -->
+		<!-- <link rel="stylesheet" href="styles.css"> -->
+	</head>
+	<body>
+		<header>
+			<h1>Reconocimiento de Objetos</h1>
+			<p>Plantilla HTML básica lista para integrarse con tu proyecto.</p>
+		</header>
+
+			<main>
+				<section id="app">
+					<h2>Interfaz</h2>
+					<p>Aquí puedes iniciar la cámara y clasificar frames usando MobileNet.</p>
+
+					<div id="controls">
+						<button id="btn-start">Iniciar cámara</button>
+						<button id="btn-stop" disabled>Detener cámara</button>
+						<button id="btn-classify" disabled>Clasificar frame</button>
+						<label style="margin-left:8px">Auto:
+							<input type="checkbox" id="chk-auto" />
+						</label>
+					</div>
+
+					<div id="video-container" style="margin-top:12px; display:flex; gap:12px; align-items:flex-start;">
+									<div style="flex:0 0 640px;">
+										<!--
+											Atributos importantes para compatibilidad móvil:
+											- autoplay + muted: permiten autoplay en muchos navegadores
+											- playsinline / webkit-playsinline: evitan fullscreen automático en iOS
+										-->
+										<video id="camera" autoplay muted playsinline webkit-playsinline width="640" height="480" style="background:#000; max-width:100%; border:1px solid #ccc"></video>
+									</div>
+
+						<div id="results" aria-live="polite" style="flex:1; min-width:200px;">
+							<h3>Resultados</h3>
+							<div id="status">Modelo: <strong id="model-status">cargando...</strong></div>
+							<ul id="results-list" style="margin-top:8px; padding-left:18px;"></ul>
+						</div>
+					</div>
+
+					<!-- Offscreen canvas para capturar frames -->
+					<canvas id="capture" style="display:none"></canvas>
+				</section>
+			</main>
+
+		<footer>
+			<p>© 2026 - Proyecto CATALOGO_PELICULAS</p>
+		</footer>
+
+			<!-- TensorFlow.js y MobileNet (CDN) -->
+			<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+			<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@latest/dist/mobilenet.min.js"></script>
+
+				<!-- Script principal: carga el modelo, controla la cámara y clasifica frames -->
+				<script>
+					console.info('Página cargada: Reconocimiento de Objetos');
+
+					// Variables globales útiles para depuración
+					window.__mobilenetModel = null;
+					window.__cameraStream = null;
+					window.__autoInterval = null;
+
+							// Try loading MobileNet via raw TensorFlow.js (tf.loadGraphModel) and fall back to the mobilenet wrapper.
+							async function loadModel() {
+								try {
+									if (typeof tf === 'undefined') {
+										console.error('TensorFlow.js no está disponible (tf undefined)');
+										document.getElementById('model-status').textContent = 'TensorFlow.js no disponible';
+										return;
+									}
+
+									console.info('TensorFlow.js versión:', (tf && (tf.version_core || tf.version)) || 'desconocida');
+									document.getElementById('model-status').textContent = 'cargando...';
+
+									// Attempt 1: load a TFJS GraphModel for MobileNet directly
+									const modelUrl = 'https://storage.googleapis.com/tfjs-models/tfjs/mobilenet_v1_1.0_224/model.json';
+									const labelsUrl = 'https://storage.googleapis.com/tfjs-models/tfjs/mobilenet_v1_1.0_224/labels.json';
+
+									try {
+										console.info('Intentando cargar MobileNet vía tf.loadGraphModel desde:', modelUrl);
+										const graphModel = await tf.loadGraphModel(modelUrl);
+
+										// Try to fetch labels JSON (optional)
+										let labels = null;
+										try {
+											const res = await fetch(labelsUrl);
+											if (res.ok) labels = await res.json();
+										} catch (errLabels) {
+											console.warn('No se pudieron descargar etiquetas de Imagenet:', errLabels && errLabels.message);
+										}
+
+										window.__tfModel = graphModel;
+										window.__tfModelType = 'graph';
+										window.__tfLabels = labels; // may be null
+										window.__mobilenetModel = null;
+
+										console.info('MobileNet (GraphModel) cargado vía TensorFlow.js. Labels:', labels ? 'sí' : 'no');
+										document.getElementById('model-status').textContent = 'cargado (tfjs graph)';
+										return;
+									} catch (errGraph) {
+										console.warn('Carga tf.loadGraphModel falló, se intentará el wrapper mobilenet:', errGraph && errGraph.message);
+									}
+
+									// Fallback: use the mobilenet wrapper which uses tfjs internally
+									console.info('Cargando modelo MobileNet vía @tensorflow-models/mobilenet (wrapper)...');
+									const wrapper = await mobilenet.load();
+									window.__mobilenetModel = wrapper;
+									window.__tfModel = null;
+									window.__tfModelType = 'mobilenet-wrapper';
+
+									console.info('MobileNet (wrapper) cargado correctamente.');
+									document.getElementById('model-status').textContent = 'cargado (wrapper)';
+
+								} catch (err) {
+									console.error('Error cargando MobileNet:', err);
+									document.getElementById('model-status').textContent = 'error';
+								}
+							}
+
+							async function startCamera() {
+								const video = document.getElementById('camera');
+								const btnStart = document.getElementById('btn-start');
+								const btnStop = document.getElementById('btn-stop');
+								const btnClassify = document.getElementById('btn-classify');
+
+								if (window.__cameraStream) {
+									console.warn('La cámara ya está activa.');
+									return;
+								}
+
+										// Helper: set stream to video element and play
+										const attachStream = async (stream) => {
+											// Ensure video element is configured for mobile autoplay/inline playback
+											try {
+												video.muted = true; // allow autoplay on many browsers
+											} catch (e) {
+												// ignore
+											}
+											// Ensure inline playback on iOS
+											try {
+												video.playsInline = true;
+												video.setAttribute('playsinline', '');
+												video.setAttribute('webkit-playsinline', '');
+											} catch (e) {
+												// ignore
+											}
+
+											video.srcObject = stream;
+											window.__cameraStream = stream;
+											try {
+												await video.play();
+											} catch (e) {
+												// Some browsers require a user gesture to play; still stream will be available.
+												console.warn('video.play() no pudo ejecutarse automáticamente:', e && e.message);
+											}
+											btnStart.disabled = true;
+											btnStop.disabled = false;
+											btnClassify.disabled = false;
+											console.info('Cámara iniciada.');
+										};
+
+								// Try facingMode first (most modern browsers)
+								try {
+									const constraintsPrefer = { video: { facingMode: { ideal: 'environment' } }, audio: false };
+									let stream = null;
+
+									try {
+										stream = await navigator.mediaDevices.getUserMedia(constraintsPrefer);
+										// If we got a stream and it's from a camera, attach
+										if (stream) {
+											await attachStream(stream);
+											return;
+										}
+									} catch (err) {
+										console.warn('Intento con facingMode falló o no disponible, intentando fallback por deviceId...', err && err.message);
+									}
+
+									// Fallback: enumerate devices and attempt to select a rear camera by label or take the last video device
+									if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+										throw new Error('enumerateDevices no soportado por el navegador');
+									}
+
+									const devices = await navigator.mediaDevices.enumerateDevices();
+									const videoDevices = devices.filter(d => d.kind === 'videoinput');
+
+									if (!videoDevices.length) {
+										throw new Error('No se detectaron dispositivos de video');
+									}
+
+									// Try to find a label that hints at back/rear camera
+									const rearRegex = /back|rear|environment|trasero|trasera/i;
+									let chosen = videoDevices.find(d => rearRegex.test(d.label));
+
+									// If labels are empty (before permission) choose the last device (often the rear camera on mobiles)
+									if (!chosen) {
+										chosen = videoDevices[videoDevices.length - 1];
+									}
+
+									if (!chosen || !chosen.deviceId) {
+										throw new Error('No se encontró deviceId válido para la cámara trasera');
+									}
+
+									const stream2 = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: chosen.deviceId } }, audio: false });
+									await attachStream(stream2);
+
+								} catch (err) {
+									console.error('No se pudo iniciar la cámara trasera:', err);
+									alert('Error al acceder a la cámara: ' + (err && err.message));
+								}
+							}
+
+					function stopCamera() {
+						const video = document.getElementById('camera');
+						const btnStart = document.getElementById('btn-start');
+						const btnStop = document.getElementById('btn-stop');
+						const btnClassify = document.getElementById('btn-classify');
+
+						if (window.__cameraStream) {
+							window.__cameraStream.getTracks().forEach(t => t.stop());
+							window.__cameraStream = null;
+							video.srcObject = null;
+						}
+
+						btnStart.disabled = false;
+						btnStop.disabled = true;
+						btnClassify.disabled = true;
+
+						if (window.__autoInterval) {
+							clearInterval(window.__autoInterval);
+							window.__autoInterval = null;
+							document.getElementById('chk-auto').checked = false;
+						}
+
+						console.info('Cámara detenida.');
+					}
+
+							async function classifyFrame() {
+								const video = document.getElementById('camera');
+								const canvas = document.getElementById('capture');
+								const resultsList = document.getElementById('results-list');
+
+								resultsList.innerHTML = '';
+
+								if ((!window.__mobilenetModel) && (!window.__tfModel)) {
+									console.warn('Modelo no cargado aún.');
+									resultsList.innerHTML = '<li>Modelo no cargado.</li>';
+									return;
+								}
+
+								if (!video || !video.videoWidth) {
+									console.warn('Video no listo. Espera a que la cámara comience.');
+									resultsList.innerHTML = '<li>Vídeo no listo.</li>';
+									return;
+								}
+
+								// Ajusta canvas al tamaño del video
+								canvas.width = video.videoWidth;
+								canvas.height = video.videoHeight;
+								const ctx = canvas.getContext('2d');
+								ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+								try {
+									if (window.__tfModelType === 'graph' && window.__tfModel) {
+										// Use raw TFJS GraphModel
+										const model = window.__tfModel;
+
+										// Preprocess: resize to 224x224, toFloat, normalize to [-1,1]
+										let img = tf.browser.fromPixels(canvas).resizeBilinear([224, 224]).toFloat();
+										img = img.expandDims(0).div(tf.scalar(127.5)).sub(tf.scalar(1));
+
+										const logits = model.predict(img);
+										// Convert logits to probabilities then to topk
+										const probs = tf.softmax(logits);
+										const topk = tf.topk(probs, 5);
+										const values = await topk.values.data();
+										const indices = await topk.indices.data();
+
+										// Map indices to labels if available
+										for (let i = 0; i < indices.length; i++) {
+											const idx = indices[i];
+											const prob = values[i];
+											const label = (window.__tfLabels && window.__tfLabels[idx]) ? window.__tfLabels[idx] : `class_${idx}`;
+											const li = document.createElement('li');
+											li.textContent = `${label} — ${(prob * 100).toFixed(2)}%`;
+											resultsList.appendChild(li);
+										}
+
+										// Dispose tensors
+										tf.dispose([img, logits, probs, topk]);
+									} else if (window.__mobilenetModel) {
+										// Use mobilenet wrapper classify (convenience)
+										const predictions = await window.__mobilenetModel.classify(canvas);
+										console.info('Predicciones (wrapper):', predictions);
+
+										if (!predictions || !predictions.length) {
+											resultsList.innerHTML = '<li>No se detectaron etiquetas.</li>';
+											return;
+										}
+
+										predictions.forEach(p => {
+											const li = document.createElement('li');
+											li.textContent = `${p.className} — ${(p.probability * 100).toFixed(2)}%`;
+											resultsList.appendChild(li);
+										});
+									} else {
+										resultsList.innerHTML = '<li>No hay modelo disponible para clasificar.</li>';
+									}
+								} catch (err) {
+									console.error('Error clasificando frame:', err);
+									resultsList.innerHTML = '<li>Error al clasificar (ver consola)</li>';
+								}
+							}
+
+					// Auto-classify toggle
+					function setAutoClassify(enabled) {
+						if (enabled) {
+							if (window.__autoInterval) return;
+							// Clasificar cada 900ms
+							window.__autoInterval = setInterval(() => {
+								classifyFrame();
+							}, 900);
+							console.info('Auto-classify activado.');
+						} else {
+							if (window.__autoInterval) {
+								clearInterval(window.__autoInterval);
+								window.__autoInterval = null;
+							}
+							console.info('Auto-classify desactivado.');
+						}
+					}
+
+					// Wire up UI
+					document.addEventListener('DOMContentLoaded', () => {
+						document.getElementById('btn-start').addEventListener('click', startCamera);
+						document.getElementById('btn-stop').addEventListener('click', stopCamera);
+						document.getElementById('btn-classify').addEventListener('click', classifyFrame);
+						document.getElementById('chk-auto').addEventListener('change', (e) => setAutoClassify(e.target.checked));
+
+						// Kick off model loading
+						loadModel();
+					});
+				</script>
+	</body>
+</html>
